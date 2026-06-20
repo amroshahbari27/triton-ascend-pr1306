@@ -52,4 +52,6 @@ def check_npu_smi_device():
 ascend_devices = get_ascend_devices()
 pci_condition = any("0xd806" in dev for dev in ascend_devices)
 npu_smi_condition = check_npu_smi_device()
-is_compile_on_910_95 = pci_condition or npu_smi_condition
+env_soc = os.environ.get("TRITON_ASCEND_SOC_VERSION", "").lower()
+env_condition = "910_95" in env_soc or "ascend950" in env_soc
+is_compile_on_910_95 = pci_condition or npu_smi_condition or env_condition

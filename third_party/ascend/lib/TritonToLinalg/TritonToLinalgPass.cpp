@@ -854,6 +854,45 @@ void TritonToLinalgPass::runOnOperation() {
         existDot = true;
         return WalkResult::interrupt();
     });
+  // L1 cache pass injects cube-core ops (ND2NZ/L12UB) which require the
+  // same IR layout as kernels with tl.dot. Only force existDot when the
+  // L1 pass will actually apply. Three patterns are detected:
+  //   (A) >=2 top-level scf.for loops (POC multi-pass pattern)
+  //   (B) 1 top-level loop containing >=2 direct-child scf.for loops
+  //       (row-tiling pattern with nested col loops)
+  //   (C) >=1 top-level scf.for loop with loads inside (prefetch pattern)
+  if (!existDot && this->compileOn91095) {
+    const char *l1Env = std::getenv("TRITON_L1_CACHE_PASS");
+    if (l1Env && std::string(l1Env) == "1") {
+      SmallVector<scf::ForOp, 4> topLoops;
+      moduleOp.walk([&](scf::ForOp forOp) {
+        if (!forOp->getParentOfType<scf::ForOp>())
+          topLoops.push_back(forOp);
+      });
+      if (topLoops.size() >= 2) {
+        existDot = true;
+      } else if (topLoops.size() == 1) {
+        int directChildLoops = 0;
+        topLoops[0].walk([&](scf::ForOp inner) {
+          if (inner.getOperation() != topLoops[0].getOperation() &&
+              inner->getParentOfType<scf::ForOp>() == topLoops[0])
+            directChildLoops++;
+        });
+        if (directChildLoops >= 2) {
+          existDot = true;
+        } else {
+          // Path C: single loop with loads → L1 prefetch candidate
+          bool hasLoads = false;
+          topLoops[0].walk([&](Operation *op) {
+            if (isa<memref::CopyOp>(op) || op->getName().getStringRef().contains("load"))
+              hasLoads = true;
+          });
+          if (hasLoads)
+            existDot = true;
+        }
+      }
+    }
+  }
   existDotFlag = existDot;
 
   // NOTE: existSIMTOp is intentionally computed AFTER

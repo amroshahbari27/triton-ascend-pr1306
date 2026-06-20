@@ -25,6 +25,7 @@
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
 // todo: this code will be removed in version 530.
 #include "ascend/include/TritonAffinityOpt/Passes.h"
+#include "ascend/include/L1CacheOpt/Passes.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "ir.h" // TritonOpBuilder
@@ -399,6 +400,10 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       mlir::triton::BufferCountManager::getInstance().setBufferCount(
           mlir::triton::BufferCountManager::DepType::LoadStore, count);
     }
+  });
+
+  m.def("add_l1_cache_opt", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createL1CacheOptPass());
   });
 }
 

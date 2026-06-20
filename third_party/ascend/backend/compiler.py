@@ -117,6 +117,25 @@ def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
             print(f"SSBUFFER return code={rc}, will fallback to enable_dynamic_cv_pipeline=False")
 
 
+def _apply_l1_cache(ir_text, metadata):
+    """Apply L1 cache buffering pass on ttadapter MLIR text."""
+    from triton.backends.ascend.l1_cache_pass import apply_l1_cache_pass
+    verbose = os.getenv("TRITON_L1_CACHE_VERBOSE", "0") == "1"
+    result = apply_l1_cache_pass(ir_text, verbose=verbose)
+    if result != ir_text:
+        # Each pid needs its own staging slice in the workspace.
+        # num_programs = grid size (rows). Conservative: allocate for max 128 pids.
+        max_pids = 128
+        per_pid = 8 * 2048 * 2  # max_tiles * tile_size * sizeof(f16)
+        ws = max_pids * per_pid
+        cur_ws = metadata.get("workspace_size", 0)
+        if cur_ws is None or (isinstance(cur_ws, int) and cur_ws < ws):
+            metadata["workspace_size"] = ws
+            if verbose:
+                print(f"[L1-CACHE] Set workspace_size = {ws} ({max_pids} pids × {per_pid} bytes)")
+    return result
+
+
 def make_ttir(mod, metadata, opt):
     if "hash" not in metadata:
         metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
@@ -233,6 +252,9 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             metadata["disable_auto_inject_block_sync"] = True
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
 
+        if os.getenv("TRITON_L1_CACHE_PASS", "0") == "1" and compile_on_910_95:
+            ascend.passes.ttir.add_l1_cache_opt(pm)
+
         _intra_val = metadata.get("intra_cache_num")
         if _intra_val is not None:
             ascend.passes.ttir.set_buffer_count("INTRA", _intra_val)
@@ -251,6 +273,17 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                                           disable_auto_inject_block_sync=disable_auto_inject_block_sync,
                                           set_workspace_multibuffer=set_workspace_multibuffer)
         _export_coalesce_metadata(mod, metadata)
+
+        # After the L1 cache C++ pass runs, ensure workspace is large enough
+        if os.getenv("TRITON_L1_CACHE_PASS", "0") == "1" and compile_on_910_95:
+            mod_str = str(mod)
+            if "triton.l1_cache_opt" in mod_str:
+                max_pids = 128
+                per_pid = 8 * 2048 * 2  # max_tiles * tile_size * sizeof(f16)
+                ws = max_pids * per_pid
+                cur_ws = metadata.get("workspace_size", 0)
+                if cur_ws is None or (isinstance(cur_ws, int) and cur_ws < ws):
+                    metadata["workspace_size"] = ws
 
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])
@@ -605,6 +638,15 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 _compile_option_list += \
                     [f"--link-aicore-bitcode={bitcode}"]
 
+        # Link extra user bitcode (e.g. a hand-written AscendC device fn compiled with
+        # `ccec -c -emit-llvm --cce-aicore-only -x cce`). Colon/comma-separated paths.
+        # INERT unless TRITON_ASCEND_EXTRA_BITCODE is set.
+        extra_bc = os.getenv("TRITON_ASCEND_EXTRA_BITCODE", "")
+        if extra_bc:
+            for bc in re.split(r"[:,]", extra_bc):
+                if bc.strip():
+                    _compile_option_list += [f"--link-aicore-bitcode={bc.strip()}"]
+
         if _is_auto_map_parallel_blocks_enabled() and not metadata.get("has_auto_blockify_blacklist_op", False):
             _compile_option_list += ["--enable-auto-blockify-loop"]
         npu_compiler_path, env = _get_npucompiler_path()
@@ -625,6 +667,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if opt.debug:
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
+        if os.getenv("TRITON_MLIR_PRINT_AFTER_ALL", None) == "1":
+            _compile_option_list += ["--mlir-print-ir-after-all"]
+
         cmd_list = (
             [npu_compiler_path, ttadapter_path]
             + _compile_option_list
@@ -641,14 +686,57 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
             print(f"[DEBUG] cmd_list: {' '.join(cmd_list)}")
 
+        # --- Always-on MLIR IR dump infrastructure ---
+        # TRITON_MLIR_DUMP_DIR: directory for all IR artifacts (input + pass output)
+        # TRITON_MLIR_DUMP_FILE: legacy single-file dump (stderr capture)
+        # TRITON_DUMP_BISHENGIR_CMD: also dump the exact command line
+        _mlir_dump_dir = os.getenv("TRITON_MLIR_DUMP_DIR", None)
+        _mlir_dump_file = os.getenv("TRITON_MLIR_DUMP_FILE", None)
+        _khash = metadata.get("hash", "nohash")
+
+        if _mlir_dump_dir:
+            os.makedirs(_mlir_dump_dir, exist_ok=True)
+            _input_ir_path = os.path.join(_mlir_dump_dir, f"input_{_khash}.ttadapter.mlir")
+            Path(_input_ir_path).write_text(Path(ttadapter_path).read_text())
+            _cmd_path = os.path.join(_mlir_dump_dir, f"cmd_{_khash}.txt")
+            Path(_cmd_path).write_text(" ".join(cmd_list) + "\n")
+            if not _mlir_dump_file:
+                _mlir_dump_file = os.path.join(_mlir_dump_dir, f"passes_{_khash}.mlir")
+            print(f"[MLIR-DUMP] input IR  -> {_input_ir_path}")
+            print(f"[MLIR-DUMP] cmd       -> {_cmd_path}")
+
+        if os.getenv("TRITON_DUMP_BISHENGIR_CMD", None) == "1" and not _mlir_dump_dir:
+            try:
+                _cmd_dump_dir = os.getenv("TRITON_DUMP_BISHENGIR_CMD_DIR", tmpdir)
+                os.makedirs(_cmd_dump_dir, exist_ok=True)
+                _cmd_out = os.path.join(_cmd_dump_dir, f"bishengir_cmd_{_khash}.txt")
+                Path(_cmd_out).write_text(" ".join(cmd_list) + "\n")
+                _ir_out = os.path.join(_cmd_dump_dir, f"bishengir_input_{_khash}.mlir")
+                Path(_ir_out).write_text(Path(ttadapter_path).read_text())
+                print(f"[BISHENGIR-CMD-DUMP] cmd -> {_cmd_out}")
+                print(f"[BISHENGIR-CMD-DUMP] input IR -> {_ir_out}")
+            except Exception as _e:
+                print(f"[BISHENGIR-CMD-DUMP] failed to dump: {_e}")
+
         try:
-            ret = subprocess.run(
-                cmd_list,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True
-            )
+            if _mlir_dump_file:
+                with open(_mlir_dump_file, 'w') as _df:
+                    ret = subprocess.run(
+                        cmd_list,
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=_df,
+                        check=True
+                    )
+                print(f"[MLIR-DUMP] pass IR   -> {_mlir_dump_file}")
+            else:
+                ret = subprocess.run(
+                    cmd_list,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True
+                )
         except subprocess.CalledProcessError as e:
             if opt.debug:
                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
@@ -656,6 +744,13 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
+
+        if os.getenv("TRITON_MLIR_PRINT_AFTER_ALL", None) == "1" and not _mlir_dump_file:
+            stderr_str = ret.stderr.decode('utf-8') if ret.stderr else ''
+            if stderr_str:
+                print("[TRITON-MLIR-OUTPUT-START]")
+                print(stderr_str)
+                print("[TRITON-MLIR-OUTPUT-END]")
 
         stdout_str = ret.stdout.decode('utf-8') if ret.stdout else ''
         match = re.search(r'UB\s+size\s*=\s*(\d+)\s*bits', stdout_str)
@@ -668,6 +763,10 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             print(f"[DEBUG] {bin_path} is not found")
             print(f"[DEBUG] Stderr:\n{error_msg}")
             raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)
+
+        # Route B: optionally relink an AscendC device object/lib (Eti's workaround,
+        # generalized). INERT unless TRITON_ASCEND_DEVLIB_RELINK=1.
+        _maybe_relink_with_devlib(bin_path, tmpdir)
 
         if Path(callback_path).is_file():
             lib = ctypes.CDLL(callback_path)
@@ -837,6 +936,15 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         if enable_libdevice:
             _compile_option_list += [f"--link-aicore-bitcode={get_libdevice()}"]
 
+        # Link extra user bitcode (e.g. a hand-written AscendC device fn compiled with
+        # `ccec -c -emit-llvm --cce-aicore-only -x cce`). Colon/comma-separated paths.
+        # INERT unless TRITON_ASCEND_EXTRA_BITCODE is set.
+        extra_bc = os.getenv("TRITON_ASCEND_EXTRA_BITCODE", "")
+        if extra_bc:
+            for bc in re.split(r"[:,]", extra_bc):
+                if bc.strip():
+                    _compile_option_list += [f"--link-aicore-bitcode={bc.strip()}"]
+
         disable_size_align_for_cast = metadata["disable_size_align_for_cast"]
         if disable_size_align_for_cast is not None:
             _compile_option_list += \
@@ -890,6 +998,13 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             print(f"[DEBUG] Stderr:\n{error_msg}")
             raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)
 
+        # Optional: link a hand-written AscendC device library into the kernel object.
+        # hivmc does the final link and won't take external link flags, so (like Eti
+        # Siminchi's aclshmem workaround) we detect an unresolved relocatable kernel.o
+        # and re-link it with ld.lld, pulling in the device lib. INERT unless
+        # TRITON_ASCEND_DEVLIB_RELINK=1 is set, so normal compiles are unaffected.
+        _maybe_relink_with_devlib(bin_path, tmpdir)
+
         if Path(callback_path).is_file():
             lib = ctypes.CDLL(callback_path)
             __get_metadata_attr_by_callback(lib, "_infer_task_type_function", metadata, "bs_task_type")
@@ -898,6 +1013,93 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_init_function", metadata, "lock_init_val")
 
         return Path(bin_path).read_bytes()
+
+
+def _maybe_relink_with_devlib(bin_path: str, tmpdir: str):
+    """Re-link the produced AI-core kernel object with a hand-written AscendC device
+    library, so a Triton kernel can call AscendC device functions/templates.
+
+    Background: hivmc performs the final link and does not accept external link flags,
+    so an AscendC symbol referenced from the kernel survives unresolved in the
+    relocatable kernel.o. This generalizes Eti Siminchi's aclshmem workaround: detect
+    that situation and relink with ld.lld, pulling in the device lib.
+
+    INERT by default. Enable with:
+      TRITON_ASCEND_DEVLIB_RELINK=1
+      TRITON_ASCEND_DEVLIB_DIR=<dir containing lib<name>.a/.so>
+      TRITON_ASCEND_DEVLIB_NAME=<name>            (the -l<name>; default: aclshmem_device_api)
+    Optional:
+      TRITON_ASCEND_DEVLIB_SYMBOLS=sym1,sym2,...  (unresolved markers that trigger relink;
+                                                   default: aclshmem,shmem,barrier_on_stream_kernel)
+      TRITON_ASCEND_LD_LLD=<path to ld.lld>
+    """
+    if os.environ.get("TRITON_ASCEND_DEVLIB_RELINK", "0") != "1":
+        return  # inert: normal compiles unaffected
+
+    bin_path = str(bin_path)
+    if not Path(bin_path).is_file():
+        print(f"[DEVLIB] skip relink: output missing: {bin_path}")
+        return
+
+    lib_dir = os.environ.get("TRITON_ASCEND_DEVLIB_DIR")
+    if not lib_dir:
+        raise RuntimeError("TRITON_ASCEND_DEVLIB_RELINK=1 but TRITON_ASCEND_DEVLIB_DIR is not set")
+    lib_name = os.environ.get("TRITON_ASCEND_DEVLIB_NAME", "aclshmem_device_api")
+    ld_path = os.environ.get(
+        "TRITON_ASCEND_LD_LLD",
+        "/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin/ld.lld",
+    )
+    nm_path = os.environ.get("TRITON_ASCEND_LLVM_NM", "llvm-nm")
+    file_path = os.environ.get("TRITON_ASCEND_FILE_CMD", "file")
+    markers = tuple(
+        s.strip() for s in os.environ.get(
+            "TRITON_ASCEND_DEVLIB_SYMBOLS",
+            "aclshmem,shmem,barrier_on_stream_kernel",
+        ).split(",") if s.strip()
+    )
+
+    def _probe(cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, check=False)
+        except FileNotFoundError:
+            return None
+
+    # only relink a still-relocatable ELF object that actually has unresolved devlib syms.
+    # Prefer `file`; if absent (e.g. CANN container), read the ELF e_type byte directly
+    # (ET_REL=1 == relocatable). No external `file` dependency needed.
+    def _is_reloc_elf(path):
+        fp = _probe([file_path, path])
+        if fp is not None:
+            t = (fp.stdout + fp.stderr).lower()
+            if "elf" in t:
+                return "relocatable" in t
+        try:
+            with open(path, "rb") as f:
+                hdr = f.read(18)
+            if hdr[:4] != b"\x7fELF":
+                return False
+            little = hdr[5] == 1
+            etype = int.from_bytes(hdr[16:18], "little" if little else "big")
+            return etype == 1  # ET_REL
+        except Exception:
+            return False
+    if not _is_reloc_elf(bin_path):
+        print(f"[DEVLIB] skip relink: not a relocatable ELF object: {bin_path}")
+        return
+    nmp = _probe([nm_path, "-u", bin_path])
+    if nmp is None or not any(m in (nmp.stdout + nmp.stderr) for m in markers):
+        print(f"[DEVLIB] skip relink: no unresolved {markers} symbols in {bin_path}")
+        return
+
+    out = os.path.join(tmpdir, "kernel.devlib.o")
+    link_cmd = [ld_path, f"-l{lib_name}", f"-L{lib_dir}",
+                "-m", "aicorelinux", "-Ttext", "0", bin_path,
+                "-q", "-static", "-o", out]
+    print(f"[DEVLIB] relinking with {lib_name}: {' '.join(link_cmd)}")
+    subprocess.run(link_cmd, capture_output=True, check=True)
+    import shutil
+    shutil.copyfile(out, bin_path)
+    print(f"[DEVLIB] relink OK -> {bin_path}")
 
 
 def get_libdevice():
@@ -1079,6 +1281,19 @@ def ttir_to_npubin(mod, metadata, opt):
                         f"--append-bisheng-options={bisheng_options}"
                     ]
 
+            # Link extra user bitcode (hand-written AscendC device fn) in SIMT mode,
+            # using the SAME mechanism libdevice uses here (-cce-link-aicore-ll-module),
+            # not the bishengir-native --link-aicore-bitcode (which routes through the
+            # HIVM lowering that asserts on non-HIVM bitcode).
+            # INERT unless TRITON_ASCEND_EXTRA_BITCODE is set.
+            extra_bc = os.getenv("TRITON_ASCEND_EXTRA_BITCODE", "")
+            if extra_bc:
+                for bc in re.split(r"[:,]", extra_bc):
+                    if bc.strip():
+                        _compile_option_list += [
+                            f"--append-bisheng-options=-cce-link-aicore-ll-module {bc.strip()}"
+                        ]
+
             # Enable SIMT auto-blockify when TRITON_ALL_BLOCKS_PARALLEL is set,
             # mirroring the SIMD compile paths. driver.py's runtime block-count
             # cap keys off the same env switch, so the two stay in sync.
@@ -1099,6 +1314,9 @@ def ttir_to_npubin(mod, metadata, opt):
             print(f"[DEBUG] {bin_path} is not found")
             print(f"[DEBUG] Stderr:\n{error_msg}")
             raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)
+        # Route B: optionally relink an AscendC device object/lib (Eti's workaround).
+        # INERT unless TRITON_ASCEND_DEVLIB_RELINK=1.
+        _maybe_relink_with_devlib(bin_path, tmpdir)
         return Path(bin_path).read_bytes()
 
 
@@ -1181,6 +1399,11 @@ class AscendBackend(BaseBackend):
             stages["ttadapter"] = lambda src, metadata: ttir_to_linalg(
                 src, metadata, options, named_ops=True
             )
+            if os.getenv("TRITON_L1_CACHE_PASS", "0") == "1":
+                # L1 cache optimization is now a real C++ MLIR pass
+                # integrated into the ttir_to_linalg pipeline.
+                # See lib/L1CacheOpt/L1CacheOptPass.cpp
+                pass
             if options.compile_on_910_95:
                 stages["npubin"] = (
                     lambda src, metadata: linalg_to_bin_enable_npu_compile_910_95(
