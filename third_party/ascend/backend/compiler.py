@@ -259,6 +259,15 @@ def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
             print(f"SSBUFFER return code={rc}, will fallback to enable_dynamic_cv_pipeline=False")
 
 
+def _configure_cv_split_metadata(metadata):
+    """Use the explicit MIX schedule after CV split commits transactionally."""
+    metadata["enable_dynamic_cv_pipeline"] = False
+    metadata["enable_mixed_cv"] = True
+    metadata["disable_auto_inject_block_sync"] = True
+    metadata["sync_solver"] = True
+    metadata["set_workspace_multibuffer"] = 0
+
+
 def _get_dump_paths(hash_key: str, src_path: str, dst_path: str) -> Tuple[str, str]:
     dump_manager = get_dump_manager(hash_key)
     return (dump_manager._make_path(os.path.basename(src_path)), dump_manager._make_path(os.path.basename(dst_path)))
@@ -383,7 +392,13 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         # bishengir-opt, so the loss happens in code generation.
         if compile_on_910_95:
             ascend.passes.ttir.add_merge_concat_load_buffer(pm)
-        if metadata["enable_dynamic_cv_pipeline"]:
+        try_cv_split = bool(metadata.get("enable_cv_split_scheduling") and compile_on_910_95)
+        if try_cv_split:
+            ascend.passes.ttir.add_cv_split_scheduling(
+                pm, compile_on_910_95, metadata["cv_split_unroll_factor"],
+                enable_vf_rewrite=metadata["cv_split_enable_vf_rewrite"])
+
+        if metadata["enable_dynamic_cv_pipeline"] and not try_cv_split:
             metadata["set_workspace_multibuffer"] = 0
             metadata["enable_mixed_cv"] = True
             metadata["disable_auto_inject_block_sync"] = True
@@ -426,6 +441,9 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             print(f"[DEBUG] cmd list: {shlex.join(cmd)}")
 
         pm.run(mod, 'ttir_to_linalg')
+        cv_split_applied = _get_then_remove_rc(mod, "triton_ascend.cv_split_scheduling.applied") == 1
+        if cv_split_applied:
+            _configure_cv_split_metadata(metadata)
         _adjust_metadata_by_module_result(mod, metadata, opt, enable_mixed_cv=enable_mixed_cv,
                                           disable_auto_inject_block_sync=disable_auto_inject_block_sync,
                                           set_workspace_multibuffer=set_workspace_multibuffer)
@@ -1241,6 +1259,9 @@ class NPUOptions:
     enable_vf_fusion: bool = None
     enable_dynamic_cv_pipeline: bool = None
     enable_cube_block_merge: bool = False
+    enable_cv_split_scheduling: bool = False
+    cv_split_unroll_factor: int = 4
+    cv_split_enable_vf_rewrite: bool = False
     hfusion_enable_multiple_consumer_fusion: bool = None
     buf_slot_num_of_veccore: int = None
     buf_slot_num_of_crosscore: int = None
