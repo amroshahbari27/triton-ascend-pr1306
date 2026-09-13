@@ -1059,8 +1059,22 @@ LogicalResult retileStores(scope::ScopeOp scope, Value subBlock,
     offsets.front() = getAsOpFoldResult(
         builder.create<arith::AddIOp>(scope.getLoc(), old, delta));
     sizes[dim] = builder.getIndexAttr(partition.perAIVExtent);
-    auto type =
+    auto partitioned =
         mlir::cast<MemRefType>(partitionType(viewCast.getType(), partition));
+    // The offset just became an SSA value, so the result type must declare a
+    // DYNAMIC offset.  Reusing the source layout, whose offset is static, makes
+    // the verifier reject the cast with "expected result type with offset =
+    // dynamic instead of 0" and takes the whole compilation down instead of
+    // falling back.
+    SmallVector<int64_t> resultStrides;
+    int64_t resultOffset;
+    if (failed(partitioned.getStridesAndOffset(resultStrides, resultOffset)))
+      return failure();
+    auto type = MemRefType::get(
+        partitioned.getShape(), partitioned.getElementType(),
+        StridedLayoutAttr::get(builder.getContext(), ShapedType::kDynamic,
+                               resultStrides),
+        partitioned.getMemorySpace());
     auto replacement = builder.create<memref::ReinterpretCastOp>(
         scope.getLoc(), type, viewCast.getSource(), offsets.front(), sizes,
         strides);
