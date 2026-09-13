@@ -23,8 +23,15 @@ PrepareSSA
 | `ScheduleSSA` | Start ready work on each resource at its earliest legal level. Greater reverse depth wins same-resource contention; source order breaks ties. |
 | `SSABufferAndAllocate` | Derive inclusive lifetimes, assign L0C/UB/L1 slots and exact events, then emit concrete movements and Cube/Vector scopes. |
 
-`Pipeline.h` defines the shared graph. No CVSplit-owned physical buffer,
-transfer, scope, set, or wait exists before the final stage.
+`Pipeline.h` defines the shared graph and the handoff contract. No CVSplit-owned
+physical buffer, transfer, scope, set, or wait exists before the final stage.
+
+Only `VFRewrite.cpp` and `VFRewritePatterns.td` may recognise a particular
+computation. Every other file knows resources, edges, layouts, lifetimes, slots
+and events, and nothing else. The rewrite is optional in both directions: every
+input accepted with it enabled is accepted with it disabled, and a group it
+declines is published unchanged instead of losing the split. `DESIGN.md` section
+8 states the contract.
 
 ## Supported graph
 
@@ -65,7 +72,9 @@ UB, and L1:
 
 Admitted loop-local load allocations have one copy writer and unambiguous tensor
 readers, so their write-before-read relation and peak scheduled bytes can be
-modeled explicitly. This does not prove arbitrary source-pointer stability or
+modeled explicitly. That relation has to be stated as an edge because scheduling
+physically reorders every operation and the copy and its readers have no def-use
+edge between them. It does not prove arbitrary source-pointer stability or
 cross-iteration aliasing. Same-engine values remain SSA and receive no CVSplit
 transfer buffer or event. The address spaces differ only by capacity and
 compatibility. Readiness `set` is placed immediately after concrete movement;
@@ -78,9 +87,13 @@ and a loop-wrap release/acquire.
 The input function must already have a verified MIX launch mapping. CVSplit
 does not silently convert a pure 56-AIV grid into 28 MIX programs. For an
 accepted candidate, the existing MIX group supplies one AIC and two AIV
-subblocks. The pass validates a restricted static dimension-0 partition and
-constructs adjacent half-row views from sub-block IDs 0 and 1; it does not
-perform general AIV region or alias analysis.
+subblocks. The pass validates a restricted static dimension-0 partition and constructs each
+half-row view at `old_offset + sub_block_id * (rows / 2) * row_stride`. The two
+halves are disjoint BY CONSTRUCTION under that contract, not by analysis: the
+even extent, the dense static row layout and the single validated base are
+checked, while the assumption that the sub-block id is 0 or 1 is inherited from
+the MIX mapping and is not checked here. No check in this pass inspects an
+address expression, and there is no general AIV region or alias analysis.
 
 ## Options
 
@@ -105,9 +118,10 @@ not user-selectable policies.
 | `SSAToBufferAllocation.cpp`, `BufferSlotPlan.h` | `SSABufferAndAllocate`. |
 | `Pipeline.h` | Canonical graph and stage interfaces. |
 
-At commit `17dc49065eec3f748964c784e8f8b2aaa03fb455`, the feature adds 3,988
-implementation/header/TableGen lines plus 67 build/backend/binding integration
-lines, excluding tests, documentation, and generated files.
+The feature is 4,016 implementation, header and TableGen lines plus 67 build,
+backend and binding integration lines, excluding tests, documentation and
+generated files. This is a source-size inventory, not a correctness or
+performance claim.
 
 ## Evidence boundary
 
