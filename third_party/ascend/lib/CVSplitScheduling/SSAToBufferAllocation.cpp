@@ -1109,6 +1109,17 @@ Operation *emitOwnershipSignal(OpBuilder &builder, Location loc, Resource from,
   setOpEngineTypeAttr(operation, engine(from));
   return operation;
 }
+// Removes a tensor binding of a planned buffer that nothing ended up using, so
+// a declined optional rewrite leaves no dead view behind.
+void discardUnusedBinding(Value binding) {
+  Operation *tensor = binding.getDefiningOp();
+  if (!tensor || !binding.use_empty())
+    return;
+  auto cast = tensor->getOperand(0).getDefiningOp<memref::MemorySpaceCastOp>();
+  tensor->erase();
+  if (cast && cast->use_empty())
+    cast->erase();
+}
 Value plainTensor(OpBuilder &builder, Location loc, Value buffer,
                   RankedTensorType type, EngineType owner) {
   auto memref = cast<MemRefType>(buffer.getType());
@@ -1468,6 +1479,7 @@ prepareV2CVFRewrites(SSAGraph &graph,
 
   Block *body = graph.loop.getBody();
   SmallVector<VFTransferSite> sites;
+  SmallVector<Value> prepared;
   for (TransferEmission &emission : emissions) {
     Operation *source = emission.source.getDefiningOp();
     if (!source || source->getBlock() != body)
@@ -1512,15 +1524,26 @@ prepareV2CVFRewrites(SSAGraph &graph,
     views.setInsertionPointAfter(last);
     Value destination = plainTensor(views, emission.source.getLoc(), emission.ub,
                                     packedType, EngineType::VECTOR);
+    prepared.push_back(destination);
     sites.push_back({emission.source, emission.ready, destination});
   }
   if (failed(materializeOptionalVFRewritesAfterRowSplit(sites)))
     return failure();
-  // Whatever the rewrite produced must still be the packed destination layout.
-  if (llvm::any_of(sites, [](const VFTransferSite &site) {
-        auto type = dyn_cast<RankedTensorType>(site.source.getType());
-        return !type || type.getRank() != 3;
-      }))
+  // Whatever the rewrite produced must be the packed destination layout.
+  auto packed = [](const VFTransferSite &site) {
+    auto type = dyn_cast<RankedTensorType>(site.source.getType());
+    return type && type.getRank() == 3;
+  };
+  // The rewrite is optional even when it is enabled and recognises the sources.
+  // A group it declines is published unchanged through the ordinary path; only
+  // a partially rewritten group is a failure.
+  if (llvm::none_of(sites, packed)) {
+    for (Value destination : llvm::reverse(prepared))
+      discardUnusedBinding(destination);
+    LDBG("optional VF rewrite declined; publishing through the ordinary path");
+    return success();
+  }
+  if (!llvm::all_of(sites, packed))
     return failure();
   for (auto [emission, site] : llvm::zip_equal(emissions, sites)) {
     emission.source = site.source;
