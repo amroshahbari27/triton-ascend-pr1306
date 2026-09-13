@@ -381,8 +381,11 @@ FailureOr<PhysicalPlan> buildIntervals(SSAGraph &graph) {
     if (graph.nodes[node].resource != Resource::Cube ||
         !isa<linalg::MatmulOp>(operation))
       continue;
+    // Capturing a structured binding is only legal from C++20; this target
+    // builds as gnu++17 with -Werror, so bind it to a normal variable first.
+    const unsigned matrixNode = node;
     bool tracked = llvm::any_of(plan.transfers, [&](const TransferPlan &item) {
-      return item.source == node &&
+      return item.source == matrixNode &&
              graph.nodes[item.node].transfer == TransferKind::L0CToUB;
     });
     if (!tracked) {
@@ -1591,23 +1594,45 @@ LogicalResult placeC2VReadsAtFirstUse(scf::ForOp loop) {
     }
     if (!firstUse)
       return failure();
+    // A rewrite may mark the operation that starts this consumer group. Find
+    // that operation by dependency, never by recognising a computation: walk
+    // back through the first use's operands inside this body and take the
+    // earliest marked producer the read may legally move in front of.
     Operation *anchor = firstUse;
-    if (auto add = dyn_cast<arith::AddFOp>(firstUse)) {
-      Value other = add.getLhs() == tensor.getResult() ? add.getRhs()
-                    : add.getRhs() == tensor.getResult() ? add.getLhs()
-                                                          : Value();
-      auto multiply = other ? other.getDefiningOp<arith::MulFOp>()
-                            : arith::MulFOp();
-      if (multiply)
-        for (Value operand : multiply->getOperands())
-          if (auto broadcast = operand.getDefiningOp<linalg::BroadcastOp>();
-              broadcast && broadcast->hasAttr(kConsumerGroupStart) &&
-              broadcast->getBlock() == body &&
-              broadcast->isBeforeInBlock(firstUse)) {
-            anchor = broadcast;
-            broadcast->removeAttr(kConsumerGroupStart);
-            break;
-          }
+    Operation *marked = nullptr;
+    SmallVector<Operation *> worklist{firstUse};
+    DenseSet<Operation *> seen;
+    while (!worklist.empty()) {
+      Operation *current = worklist.pop_back_val();
+      for (Value operand : current->getOperands()) {
+        Operation *producer = operand.getDefiningOp();
+        if (!producer || producer->getBlock() != body ||
+            producer == tensor.getOperation() || !seen.insert(producer).second ||
+            !producer->isBeforeInBlock(firstUse))
+          continue;
+        if (producer->hasAttr(kConsumerGroupStart)) {
+          if (!marked || producer->isBeforeInBlock(marked))
+            marked = producer;
+          continue;
+        }
+        worklist.push_back(producer);
+      }
+    }
+    // The read may only move in front of the marker when everything the read
+    // itself depends on is already defined there.
+    auto movable = [&](Operation *candidate) {
+      for (Operation *member : {wait, cast.getOperation(), tensor.getOperation()})
+        for (Value operand : member->getOperands()) {
+          Operation *producer = operand.getDefiningOp();
+          if (producer && producer->getBlock() == body &&
+              !producer->isBeforeInBlock(candidate))
+            return false;
+        }
+      return true;
+    };
+    if (marked && movable(marked)) {
+      anchor = marked;
+      marked->removeAttr(kConsumerGroupStart);
     }
     groups.push_back({wait, cast, tensor, anchor});
   }
