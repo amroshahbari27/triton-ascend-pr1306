@@ -3,7 +3,92 @@ import os
 import sys
 from unittest.mock import MagicMock
 
+import pytest
 import triton.backends.ascend.compiler as compiler
+
+pytestmark = pytest.mark.backend("cpu")
+
+
+def test_cv_split_commit_selects_explicit_mix_pipeline():
+    metadata = {
+        "multibuffer": True,
+        "set_workspace_multibuffer": 2,
+        "has_auto_blockify_blacklist_op": False,
+        "enable_dynamic_cv_pipeline": True,
+        "enable_mixed_cv": False,
+        "disable_auto_inject_block_sync": False,
+        "sync_solver": False,
+    }
+
+    compiler._configure_cv_split_metadata(metadata)
+
+    assert metadata["multibuffer"] is True
+    assert metadata["set_workspace_multibuffer"] == 0
+    assert metadata["has_auto_blockify_blacklist_op"] is False
+    assert metadata["enable_dynamic_cv_pipeline"] is False
+    assert metadata["enable_mixed_cv"] is True
+    assert metadata["disable_auto_inject_block_sync"] is True
+    assert metadata["sync_solver"] is True
+
+
+def test_explicit_cv_split_schedule_owns_backend_policy():
+    metadata = {
+        "cv_split_preserve_explicit_schedule": True,
+        "enable_auto_bind_sub_block": True,
+        "auto_tile_and_bind_subblock": True,
+        "sync_solver": False,
+        "enable_mixed_cv": True,
+    }
+
+    assert compiler.get_auto_bind_sub_block_option(metadata) is False
+    assert compiler.get_graph_sync_solver_option(metadata) is True
+    assert compiler.get_mixed_cv_option(metadata) is None
+
+
+@pytest.mark.parametrize(
+    "dynamic, cv_split, target_is_a5, expected",
+    [
+        (False, False, True, (False, False)),
+        (True, False, True, (False, True)),
+        (False, True, True, (True, False)),
+        # Auto mode: attempt CV split, then let DCVP observe the commit result
+        # and run only if CV split kept the original module.
+        (True, True, True, (True, True)),
+        (True, True, False, (False, True)),
+    ],
+)
+def test_cv_pipeline_selection(dynamic, cv_split, target_is_a5, expected):
+    metadata = {
+        "enable_dynamic_cv_pipeline": dynamic,
+        "enable_cv_split_scheduling": cv_split,
+    }
+    assert compiler._select_cv_pipeline_policy(metadata, target_is_a5) == expected
+
+
+def test_cv_split_a5_default_is_transactional_auto():
+    """The two switches carry no value of their own.
+
+    Both are left unset on the dataclass and resolved in `parse_options` from
+    `is_compile_on_910_95()`, the same way `compile_on_910_95` itself is -- so
+    on an A5 target both halves of the transactional default turn on, and on
+    anything else neither does.
+
+    This asserts that they are unset and that an explicit choice survives, not
+    which callable the field happens to hold. Pinning the field default is what
+    this test used to do, and it went stale the moment the resolution moved.
+    """
+    fields = compiler.NPUOptions.__dataclass_fields__
+    assert fields["enable_cv_split_scheduling"].default is None
+    assert fields["enable_dynamic_cv_pipeline"].default is None
+    assert fields["cv_split_unroll_factor"].default == 4
+
+    # Unset stays unset until parse_options fills it in.
+    assert compiler.NPUOptions().enable_cv_split_scheduling is None
+    assert compiler.NPUOptions().enable_dynamic_cv_pipeline is None
+
+    # An explicit choice is never overwritten by that resolution.
+    assert compiler.NPUOptions(enable_cv_split_scheduling=False).enable_cv_split_scheduling is False
+    assert compiler.NPUOptions(enable_dynamic_cv_pipeline=True).enable_dynamic_cv_pipeline is True
 
 
 def _make_torch_npu_mock(cfg_dir):
@@ -11,6 +96,30 @@ def _make_torch_npu_mock(cfg_dir):
     mock = MagicMock()
     mock.__file__ = os.path.join(cfg_dir, "__init__.py")
     return mock
+
+
+def test_cv_split_semantic_options_participate_in_cache_key(monkeypatch):
+    monkeypatch.setattr(compiler, "get_cann_version_file_hash", lambda: "fixed-toolchain")
+    defaults = compiler.NPUOptions()
+    assert defaults.cv_split_unroll_factor == 4
+    assert defaults.cv_split_enable_vf_rewrite is False
+    assert defaults.hash() != compiler.NPUOptions(cv_split_unroll_factor=2).hash()
+    assert defaults.hash() != compiler.NPUOptions(cv_split_enable_vf_rewrite=True).hash()
+
+
+@pytest.mark.parametrize(
+    "removed",
+    [
+        "cv_split_l0c_buffer_mode",
+        "cv_split_enable_l0c_drain_widening",
+        "cv_split_private_buffer_ub_budget_bytes",
+        "cv_split_promote_fully_unrolled",
+    ],
+)
+def test_removed_cv_split_policy_options_are_rejected(removed):
+    assert removed not in compiler.NPUOptions.__dataclass_fields__
+    with pytest.raises(TypeError, match=removed):
+        compiler.NPUOptions(**{removed: True})
 
 
 def _write_acl_config(cfg_dir, config):
