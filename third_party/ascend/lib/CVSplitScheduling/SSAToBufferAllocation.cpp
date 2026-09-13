@@ -1457,22 +1457,20 @@ prepareV2CVFRewrites(SSAGraph &graph,
                      DenseMap<Value, Operation *> &consumerCompletions) {
   if (emissions.empty())
     return success();
-  bool allMarked = true;
-  for (TransferEmission &emission : emissions) {
-    auto cast = emission.source.getDefiningOp<arith::TruncFOp>();
-    auto exp = cast ? cast.getIn().getDefiningOp<math::ExpOp>() : math::ExpOp();
-    allMarked &= exp && exp->hasAttr("cv_split.vf_role");
-  }
-  if (!allMarked)
+  SmallVector<Value> sources;
+  for (TransferEmission &emission : emissions)
+    sources.push_back(emission.source);
+  // Whether a rewrite applies is a pattern question, so it is asked, not
+  // answered, here.  Nothing below inspects the computation that produced the
+  // published value.
+  if (!optionalVFRewriteClaims(sources))
     return success();
 
   Block *body = graph.loop.getBody();
   SmallVector<VFTransferSite> sites;
   for (TransferEmission &emission : emissions) {
-    auto cast = emission.source.getDefiningOp<arith::TruncFOp>();
-    auto exp = cast ? cast.getIn().getDefiningOp<math::ExpOp>() : math::ExpOp();
     Operation *source = emission.source.getDefiningOp();
-    if (!source || source->getBlock() != body || !exp)
+    if (!source || source->getBlock() != body)
       return failure();
     OpBuilder signalBuilder(source);
     signalBuilder.setInsertionPointAfter(source);
@@ -1486,46 +1484,39 @@ prepareV2CVFRewrites(SSAGraph &graph,
         sourceType.getDimSize(1) <= 0 || sourceType.getDimSize(1) % kNzTileSize)
       return failure();
     Operation *allocation = emission.ub.getDefiningOp();
-    auto shift = exp.getOperand().getDefiningOp<arith::SubFOp>();
-    Operation *anchor = shift ? shift.getLhs().getDefiningOp() : nullptr;
-    if (!isa_and_nonnull<memref::AllocOp>(allocation) || !anchor ||
-        allocation->getBlock() != body || anchor->getBlock() != body)
+    if (!isa_and_nonnull<memref::AllocOp>(allocation) ||
+        allocation->getBlock() != body)
       return failure();
-    if (anchor->isBeforeInBlock(allocation)) {
-      allocation->moveBefore(anchor);
-      SmallVector<Operation *> marks;
-      for (Operation *user : allocation->getUsers())
-        if (isa<annotation::MarkOp>(user))
-          marks.push_back(user);
-      for (Operation *mark : marks)
-        mark->moveBefore(anchor);
+    // A rewrite may write the destination earlier than the original producer
+    // did, so the planned storage is hoisted to the top of the body.  The
+    // allocation has no operands, so this is always legal, and it changes no
+    // space, size, slot or event decision.
+    if (allocation != &body->front())
+      allocation->moveBefore(&body->front());
+    Operation *last = allocation;
+    SmallVector<Operation *> marks;
+    for (Operation *user : allocation->getUsers())
+      if (isa<annotation::MarkOp>(user))
+        marks.push_back(user);
+    for (Operation *mark : marks) {
+      mark->moveAfter(last);
+      last = mark;
     }
-    OpBuilder views(anchor);
     int64_t rows = sourceType.getDimSize(0);
     int64_t n16 = sourceType.getDimSize(1) / kNzTileSize;
     auto packedType = RankedTensorType::get({n16, rows, kNzTileSize},
                                             sourceType.getElementType());
     if (ubType.getShape() != packedType.getShape())
       return failure();
+    OpBuilder views(last);
+    views.setInsertionPointAfter(last);
     Value destination = plainTensor(views, emission.source.getLoc(), emission.ub,
                                     packedType, EngineType::VECTOR);
-    auto maximumType = RankedTensorType::get({rows}, views.getF32Type());
-    auto scaledType = RankedTensorType::get({rows, sourceType.getDimSize(1)},
-                                            views.getF32Type());
-    Value maximumDestination =
-        allocateTensor(views, emission.source.getLoc(), maximumType,
-                       "cvsplit.softmax.max-rows", EngineType::VECTOR);
-    Value scaledDestination =
-        allocateTensor(views, emission.source.getLoc(), scaledType,
-                       "cvsplit.softmax.scaled-rows", EngineType::VECTOR);
-    Value sumDestination =
-        allocateTensor(views, emission.source.getLoc(), maximumType,
-                       "cvsplit.softmax.sum-rows", EngineType::VECTOR);
-    sites.push_back({emission.source, emission.ready, destination,
-                     maximumDestination, scaledDestination, sumDestination});
+    sites.push_back({emission.source, emission.ready, destination});
   }
   if (failed(materializeOptionalVFRewritesAfterRowSplit(sites)))
     return failure();
+  // Whatever the rewrite produced must still be the packed destination layout.
   if (llvm::any_of(sites, [](const VFTransferSite &site) {
         auto type = dyn_cast<RankedTensorType>(site.source.getType());
         return !type || type.getRank() != 3;
@@ -1898,6 +1889,10 @@ void seedLoopWrapCreditsOnce(const PhysicalPlan &plan, const SSAGraph &graph,
   emit(scopes.vectorScope, vector);
 }
 } // namespace
+Value allocateVectorScratchTensor(OpBuilder &builder, Location loc,
+                                  RankedTensorType type, StringRef role) {
+  return allocateTensor(builder, loc, type, role, EngineType::VECTOR);
+}
 LogicalResult lowerSSAToBufferAllocation(func::FuncOp function,
                                          SSAGraph &graph) {
   ModuleOp module = function->getParentOfType<ModuleOp>();

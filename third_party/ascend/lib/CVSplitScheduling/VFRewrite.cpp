@@ -368,14 +368,19 @@ FailureOr<LaneResult> materializeLane(Lane &lane,
       {width / kPackWidth, rows, kPackWidth}, packedElement);
 
   OpBuilder outer(lane.scale);
-  Value maxInit = site.maximumDestination;
-  Value scaledInit = site.scaledDestination;
-  Value sumInit = site.sumDestination;
+  // The transfer contract supplies only the planned destination.  Row maximum,
+  // rescaled score and row sum are shapes of THIS rewrite, so this rewrite
+  // allocates them.
   Value packedInit = site.packedDestination;
-  if (!maxInit || maxInit.getType() != maximumType || !scaledInit ||
-      scaledInit.getType() != scoreRowsType || !sumInit ||
-      sumInit.getType() != maximumType || !packedInit ||
-      packedInit.getType() != packedType)
+  if (!packedInit || packedInit.getType() != packedType)
+    return failure();
+  Value maxInit = triton::cv_split::allocateVectorScratchTensor(
+      outer, loc, maximumType, "cvsplit.softmax.max-rows");
+  Value scaledInit = triton::cv_split::allocateVectorScratchTensor(
+      outer, loc, scoreRowsType, "cvsplit.softmax.scaled-rows");
+  Value sumInit = triton::cv_split::allocateVectorScratchTensor(
+      outer, loc, maximumType, "cvsplit.softmax.sum-rows");
+  if (!maxInit || !scaledInit || !sumInit)
     return failure();
   auto vf = outer.create<scope::ScopeOp>(
       loc, TypeRange{maximumType, deferSum ? scoreRowsType : maximumType,
@@ -775,6 +780,18 @@ LogicalResult mlir::triton::cv_split::applyVFRewriteStage(scf::ForOp loop,
   walkAndApplyPatterns(loop.getOperation(), frozen);
   LDBG("VFRewrite completed");
   return success();
+}
+
+bool mlir::triton::cv_split::optionalVFRewriteClaims(ValueRange sources) {
+  // The only recognition of a particular computation in the whole pass lives
+  // here and in matchLane below it.
+  for (Value source : sources) {
+    auto cast = source.getDefiningOp<arith::TruncFOp>();
+    auto exp = cast ? cast.getIn().getDefiningOp<math::ExpOp>() : math::ExpOp();
+    if (!exp || !exp->hasAttr(kRole))
+      return false;
+  }
+  return true;
 }
 
 LogicalResult

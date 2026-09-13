@@ -6,7 +6,9 @@
 // after scheduling.
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -79,16 +81,28 @@ void setOpEngineTypeAttr(Operation *, EngineType);
 void removeEngineTypeAttrs(ModuleOp);
 FailureOr<scf::ForOp> prepareSSA(func::FuncOp, int unrollFactor);
 LogicalResult applyVFRewriteStage(scf::ForOp, bool enablePatterns);
+// One Vector-to-Cube publication offered to the optional VF rewrite stage.
+// The graph stages own the resource, the slot, the packed layout and the event.
+// A rewrite may only replace the Vector-side expression that produces `source`,
+// and whatever it produces must be the packed destination's layout. No field
+// here describes a particular computation; scratch storage whose shape belongs
+// to a pattern is allocated by the rewrite itself.
 struct VFTransferSite {
-  Value source;
-  Operation *ready;
-  Value packedDestination;
-  Value maximumDestination;
-  Value scaledDestination;
-  Value sumDestination;
-  Value consumedInput;
-  Operation *consumptionComplete = nullptr;
+  Value source;                 // in: value to publish. out: its packed replacement.
+  Operation *ready = nullptr;   // in: readiness signal already emitted for this transfer.
+  Value packedDestination;      // in: tensor bound to the planned UB slot.
+  Value consumedInput;          // out: input whose final consumption the rewrite completed.
+  Operation *consumptionComplete = nullptr; // out: operation completing that consumption.
 };
+// True when the optional rewrite recognises every source of one publication
+// group. The graph stages call this only to decide whether preparing rewrite
+// state is worthwhile; the recognition itself stays inside the rewrite.
+bool optionalVFRewriteClaims(ValueRange sources);
+// Allocates one UB-backed tensor at the builder's insertion point and binds it
+// to a tensor value. `role` names the storage for debugging only. Exposed so a
+// rewrite can allocate scratch whose shape is part of its own pattern.
+Value allocateVectorScratchTensor(OpBuilder &, Location, RankedTensorType,
+                                  StringRef role);
 LogicalResult
     materializeOptionalVFRewritesAfterRowSplit(MutableArrayRef<VFTransferSite>);
 FailureOr<SSAGraph> buildSSAGraph(scf::ForOp);
