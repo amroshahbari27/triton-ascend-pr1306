@@ -1525,7 +1525,8 @@ prepareV2CVFRewrites(SSAGraph &graph,
     Value destination = plainTensor(views, emission.source.getLoc(), emission.ub,
                                     packedType, EngineType::VECTOR);
     prepared.push_back(destination);
-    sites.push_back({emission.source, emission.ready, destination});
+    sites.push_back({emission.source, emission.ready, destination, Value(),
+                     nullptr});
   }
   if (failed(materializeOptionalVFRewritesAfterRowSplit(sites)))
     return failure();
